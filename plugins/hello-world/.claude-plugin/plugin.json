@@ -1,0 +1,13 @@
+{
+  "name": "hello-world",
+  "version": "1.0.0",
+  "description": "Example plugin demonstrating basic structure",
+  "author": {
+    "name": "g-shudy",
+    "email": "your.email@example.com",
+    "url": "https://ghsj.me"
+  },
+  "repository": "https://github.com/g-shudy/claude-plugins",
+  "license": "MIT",
+  "keywords": ["example", "template", "hello-world"]
+}

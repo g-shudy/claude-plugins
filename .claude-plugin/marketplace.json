@@ -1,0 +1,23 @@
+{
+  "name": "g-shudy-plugins",
+  "description": "Personal Claude Code plugins for workflow automation, file intelligence, and productivity",
+  "owner": {
+    "name": "g-shudy",
+    "url": "https://ghsj.me"
+  },
+  "repository": "https://github.com/g-shudy/claude-plugins",
+  "plugins": [
+    {
+      "name": "hello-world",
+      "source": "./plugins/hello-world",
+      "description": "Example plugin demonstrating basic structure",
+      "version": "1.0.0",
+      "category": "example",
+      "keywords": ["example", "template", "hello-world"],
+      "author": {
+        "name": "g-shudy",
+        "url": "https://ghsj.me"
+      }
+    }
+  ]
+}
