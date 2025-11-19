@@ -130,8 +130,26 @@ else
 fi
 
 APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
-    set startDate to date \"${START_DATE}T00:00:00\"
-    set endDate to date \"${END_DATE}T23:59:59\"
+    -- Parse start date
+    set startComponents to my split(\"${START_DATE}\", \"-\")
+    set startDate to current date
+    set year of startDate to (item 1 of startComponents as integer)
+    set month of startDate to (item 2 of startComponents as integer)
+    set day of startDate to (item 3 of startComponents as integer)
+    set hours of startDate to 0
+    set minutes of startDate to 0
+    set seconds of startDate to 0
+
+    -- Parse end date
+    set endComponents to my split(\"${END_DATE}\", \"-\")
+    set endDate to current date
+    set year of endDate to (item 1 of endComponents as integer)
+    set month of endDate to (item 2 of endComponents as integer)
+    set day of endDate to (item 3 of endComponents as integer)
+    set hours of endDate to 23
+    set minutes of endDate to 59
+    set seconds of endDate to 59
+
     set eventList to {}
 
     repeat with cal in calendarList
@@ -160,7 +178,15 @@ APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
         set AppleScript's text item delimiters to \"||\"
         return eventList as text
     end if
-end tell"
+end tell
+
+on split(theString, theDelimiter)
+    set oldDelimiters to AppleScript's text item delimiters
+    set AppleScript's text item delimiters to theDelimiter
+    set theArray to every text item of theString
+    set AppleScript's text item delimiters to oldDelimiters
+    return theArray
+end split"
 
 # Run with timeout
 RESULT=$(timeout $TIMEOUT osascript -e "$APPLESCRIPT_QUERY" 2>&1 || echo "TIMEOUT")
