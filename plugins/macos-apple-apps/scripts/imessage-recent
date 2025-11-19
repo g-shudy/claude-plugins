@@ -1,0 +1,220 @@
+#!/bin/bash
+# imessage-recent - Get recent iMessages via direct SQLite access
+# Works even when Messages.app is not running
+
+set -euo pipefail
+
+show_help() {
+  cat <<EOF
+Usage: imessage-recent [hours]
+
+Get recent iMessages from specified time window via direct SQLite access.
+
+Arguments:
+  [hours]              Hours to look back (default: 24)
+
+Options:
+  -h, --help           Show this help message
+  -d, --days DAYS      Look back N days instead of hours
+  -l, --limit N        Limit results to N messages (default: 20)
+  -j, --json           Output as JSON
+  -p, --pattern TEXT   Filter for messages containing pattern (case-insensitive)
+  -n, --notation       Check for Vault notation patterns
+
+Examples:
+  imessage-recent          # Last 24 hours (default)
+  imessage-recent 6        # Last 6 hours
+  imessage-recent -d 3     # Last 3 days
+  imessage-recent -l 10    # Only 10 most recent
+  imessage-recent -p "lunch"              # Messages containing "lunch"
+  imessage-recent -n                      # Check for notation patterns
+
+Output format (default):
+  [YYYY-MM-DD HH:MM:SS] sender: message text (first 80 chars)
+
+Exit codes:
+  0    Success
+  1    Messages database not found
+  2    Error querying database
+
+Notes:
+  • Works without Messages.app running (direct SQLite access)
+  • Database: ~/Library/Messages/chat.db
+  • --notation checks for: (ghsj→cc:, (cc→ghsj:, >>move:, [MUST], etc.
+EOF
+}
+
+# Notation patterns to check
+NOTATION_PATTERNS=(
+    "(ghsj→cc:"
+    "(ghsj:"
+    "(cc→ghsj:"
+    "(cc-suggest:"
+    "(cc-warn:"
+    ">>move:"
+    ">>archive"
+    ">>defer:"
+    "\[MUST\]"
+    "\[SHOULD\]"
+)
+
+# Parse arguments
+HOURS=24
+DAYS=""
+LIMIT=20
+JSON=false
+PATTERN=""
+CHECK_NOTATION=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    -d|--days)
+      DAYS="$2"
+      shift 2
+      ;;
+    -l|--limit)
+      LIMIT="$2"
+      shift 2
+      ;;
+    -j|--json)
+      JSON=true
+      shift
+      ;;
+    -p|--pattern)
+      PATTERN="$2"
+      shift 2
+      ;;
+    -n|--notation)
+      CHECK_NOTATION=true
+      shift
+      ;;
+    [0-9]*)
+      HOURS="$1"
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+# Calculate cutoff timestamp
+if [[ -n "$DAYS" ]]; then
+    CUTOFF_TIMESTAMP=$(date -v-${DAYS}d +%s)
+else
+    CUTOFF_TIMESTAMP=$(date -v-${HOURS}H +%s)
+fi
+
+# Check if database exists
+IMESSAGE_DB="${HOME}/Library/Messages/chat.db"
+if [[ ! -f "$IMESSAGE_DB" ]]; then
+    echo "Error: Messages database not found at $IMESSAGE_DB" >&2
+    exit 1
+fi
+
+# Build SQL query
+SQL_QUERY="SELECT
+    datetime(message.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as time,
+    COALESCE(handle.id, 'Unknown') as sender,
+    message.text
+FROM message
+LEFT JOIN handle ON message.handle_id = handle.ROWID
+WHERE message.date/1000000000 + strftime('%s', '2001-01-01') >= ${CUTOFF_TIMESTAMP}
+    AND message.text IS NOT NULL
+    AND message.text != ''"
+
+# Add pattern filter if specified
+if [[ -n "$PATTERN" ]]; then
+    SQL_QUERY="$SQL_QUERY
+    AND message.text LIKE '%${PATTERN}%'"
+fi
+
+SQL_QUERY="$SQL_QUERY
+ORDER BY message.date DESC
+LIMIT ${LIMIT};"
+
+# Execute query
+RESULT=$(sqlite3 "$IMESSAGE_DB" "$SQL_QUERY" 2>/dev/null || echo "ERROR")
+
+# Handle errors
+if [[ "$RESULT" == "ERROR" ]]; then
+    echo "Error: Failed to query Messages database" >&2
+    exit 2
+fi
+
+# Handle no results
+if [[ -z "$RESULT" ]]; then
+    if $JSON; then
+        echo '{"count": 0, "messages": [], "notation_found": false}'
+    else
+        echo "No recent messages"
+    fi
+    exit 0
+fi
+
+# Check for notation patterns if requested
+NOTATION_FOUND=false
+if $CHECK_NOTATION; then
+    for pattern in "${NOTATION_PATTERNS[@]}"; do
+        if echo "$RESULT" | grep -q "$pattern"; then
+            NOTATION_FOUND=true
+            break
+        fi
+    done
+fi
+
+# Format output
+if $JSON; then
+    MESSAGE_COUNT=$(echo "$RESULT" | wc -l | tr -d ' ')
+    echo '{"count": '"$MESSAGE_COUNT"', "notation_found": '"$NOTATION_FOUND"', "messages": ['
+
+    FIRST=true
+    echo "$RESULT" | while IFS='|' read -r time sender text; do
+        if [[ -n "$time" ]]; then
+            if ! $FIRST; then
+                echo ","
+            fi
+            FIRST=false
+
+            # Escape JSON special characters
+            text_escaped=$(echo "$text" | sed 's/"/\\"/g' | sed 's/\\/\\\\/g' | tr '\n' ' ')
+            sender_escaped=$(echo "$sender" | sed 's/"/\\"/g')
+
+            echo -n "    {\"time\": \"$time\", \"from\": \"$sender_escaped\", \"text\": \"$text_escaped\"}"
+        fi
+    done
+    echo ""
+    echo "  ]}"
+else
+    if $CHECK_NOTATION && $NOTATION_FOUND; then
+        echo "⚠️  Notation patterns found in recent messages!"
+        echo ""
+    fi
+
+    echo "$RESULT" | while IFS='|' read -r time sender text; do
+        if [[ -n "$time" ]]; then
+            # Truncate text to 80 chars
+            text_short="${text:0:80}"
+            if [[ ${#text} -gt 80 ]]; then
+                text_short="${text_short}..."
+            fi
+            echo "[$time] $sender: $text_short"
+        fi
+    done
+
+    MESSAGE_COUNT=$(echo "$RESULT" | wc -l | tr -d ' ')
+    echo ""
+    echo "Total: $MESSAGE_COUNT messages"
+    if $CHECK_NOTATION; then
+        if $NOTATION_FOUND; then
+            echo "Notation: FOUND ⚠️"
+        else
+            echo "Notation: None"
+        fi
+    fi
+fi

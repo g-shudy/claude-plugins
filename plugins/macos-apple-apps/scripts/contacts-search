@@ -1,0 +1,239 @@
+#!/bin/bash
+# contacts-search - Search Apple Contacts
+
+set -euo pipefail
+
+show_help() {
+  cat <<EOF
+Usage: contacts-search [OPTIONS] [QUERY]
+
+Search for contacts in Apple Contacts app.
+
+Arguments:
+  [QUERY]                    Search term (name, email, phone, company)
+
+Options:
+  -h, --help                 Show this help message
+  -j, --json                 Output as JSON
+  -l, --limit N              Limit results to N contacts (default: 20)
+  -a, --all                  Show all contacts (no limit)
+  -v, --verbose              Show full contact details
+
+Examples:
+  contacts-search john                # Search for "john"
+  contacts-search "Smith"             # Search for "Smith"
+  contacts-search -v jane             # Detailed info for "jane"
+  contacts-search -l 5 tech           # First 5 matches for "tech"
+  contacts-search -a                  # List all contacts
+
+Output format (default):
+  Name | Email | Phone | Company
+
+Output format (verbose):
+  Full contact card with all available details
+
+Exit codes:
+  0    Success
+  1    Invalid arguments
+  2    Error querying Contacts.app
+
+Notes:
+  • Search is case-insensitive
+  • Searches across: first name, last name, email, phone, company
+  • Does not require Contacts.app to be running
+EOF
+}
+
+# Parse arguments
+QUERY=""
+JSON=false
+LIMIT=20
+VERBOSE=false
+ALL=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    -j|--json)
+      JSON=true
+      shift
+      ;;
+    -l|--limit)
+      LIMIT="$2"
+      shift 2
+      ;;
+    -a|--all)
+      ALL=true
+      shift
+      ;;
+    -v|--verbose)
+      VERBOSE=true
+      shift
+      ;;
+    *)
+      QUERY="$1"
+      shift
+      ;;
+  esac
+done
+
+# Build AppleScript query
+if [[ -n "$QUERY" ]]; then
+    # Search for specific term
+    QUERY_ESCAPED=$(echo "$QUERY" | sed "s/'/\\\\'/g")
+    APPLESCRIPT_QUERY="tell application \"Contacts\"
+    set searchTerm to \"$QUERY_ESCAPED\"
+    set matchingPeople to (every person whose name contains searchTerm or organization contains searchTerm or value of emails contains searchTerm or value of phones contains searchTerm)
+
+    if (count of matchingPeople) = 0 then
+        return \"NONE\"
+    else
+        set contactList to {}
+        set counter to 0
+        repeat with aPerson in matchingPeople
+            set counter to counter + 1"
+
+    if [[ "$ALL" == false ]]; then
+        APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
+            if counter > $LIMIT then exit repeat"
+    fi
+
+    APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
+            try
+                set personName to name of aPerson
+            on error
+                set personName to \"(No name)\"
+            end try
+
+            try
+                set personEmail to value of first email of aPerson
+            on error
+                set personEmail to \"\"
+            end try
+
+            try
+                set personPhone to value of first phone of aPerson
+            on error
+                set personPhone to \"\"
+            end try
+
+            try
+                set personCompany to organization of aPerson
+            on error
+                set personCompany to \"\"
+            end try
+
+            set contactInfo to personName & \"|\" & personEmail & \"|\" & personPhone & \"|\" & personCompany
+            set end of contactList to contactInfo
+        end repeat
+
+        set AppleScript's text item delimiters to \"||\"
+        return contactList as text
+    end if
+end tell"
+elif [[ "$ALL" == true ]]; then
+    # List all contacts
+    APPLESCRIPT_QUERY="tell application \"Contacts\"
+    set allPeople to every person
+    set contactList to {}
+
+    repeat with aPerson in allPeople
+        try
+            set personName to name of aPerson
+        on error
+            set personName to \"(No name)\"
+        end try
+
+        try
+            set personEmail to value of first email of aPerson
+        on error
+            set personEmail to \"\"
+        end try
+
+        try
+            set personPhone to value of first phone of aPerson
+        on error
+            set personPhone to \"\"
+        end try
+
+        try
+            set personCompany to organization of aPerson
+        on error
+            set personCompany to \"\"
+        end try
+
+        set contactInfo to personName & \"|\" & personEmail & \"|\" & personPhone & \"|\" & personCompany
+        set end of contactList to contactInfo
+    end repeat
+
+    set AppleScript's text item delimiters to \"||\"
+    return contactList as text
+end tell"
+else
+    echo "Error: Provide a search query or use --all to list all contacts" >&2
+    exit 1
+fi
+
+# Execute query
+RESULT=$(osascript -e "$APPLESCRIPT_QUERY" 2>&1 || echo "ERROR")
+
+# Handle errors
+if [[ "$RESULT" == "ERROR" ]] || [[ "$RESULT" == *"error"* ]]; then
+    echo "Error: Failed to query Contacts.app" >&2
+    echo "$RESULT" >&2
+    exit 2
+fi
+
+# Handle no results
+if [[ "$RESULT" == "NONE" ]]; then
+    if $JSON; then
+        echo '{"count": 0, "contacts": []}'
+    else
+        echo "No contacts found for: $QUERY"
+    fi
+    exit 0
+fi
+
+# Format output
+if $JSON; then
+    CONTACT_COUNT=$(echo "$RESULT" | tr '||' '\n' | wc -l | tr -d ' ')
+    echo '{"count": '"$CONTACT_COUNT"', "contacts": ['
+
+    FIRST=true
+    echo "$RESULT" | tr '||' '\n' | while IFS='|' read -r name email phone company; do
+        if [[ -n "$name" ]]; then
+            if ! $FIRST; then
+                echo ","
+            fi
+            FIRST=false
+
+            # Escape JSON
+            name=$(echo "$name" | sed 's/"/\\"/g')
+            email=$(echo "$email" | sed 's/"/\\"/g')
+            phone=$(echo "$phone" | sed 's/"/\\"/g')
+            company=$(echo "$company" | sed 's/"/\\"/g')
+
+            echo -n "    {\"name\": \"$name\", \"email\": \"$email\", \"phone\": \"$phone\", \"company\": \"$company\"}"
+        fi
+    done
+    echo ""
+    echo "  ]}"
+else
+    CONTACT_COUNT=$(echo "$RESULT" | tr '||' '\n' | wc -l | tr -d ' ')
+    echo "Found $CONTACT_COUNT contacts"
+    [[ -n "$QUERY" ]] && echo " matching: $QUERY"
+    echo ""
+
+    echo "$RESULT" | tr '||' '\n' | while IFS='|' read -r name email phone company; do
+        if [[ -n "$name" ]]; then
+            echo "$name"
+            [[ -n "$email" ]] && echo "  Email: $email"
+            [[ -n "$phone" ]] && echo "  Phone: $phone"
+            [[ -n "$company" ]] && echo "  Company: $company"
+            echo ""
+        fi
+    done
+fi

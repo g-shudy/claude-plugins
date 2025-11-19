@@ -18,6 +18,18 @@
         "name": "g-shudy",
         "url": "https://ghsj.me"
       }
+    },
+    {
+      "name": "macos-apple-apps",
+      "source": "./plugins/macos-apple-apps",
+      "description": "Claude Code integration with macOS Apple productivity apps (Calendar, Contacts, Mail, Messages, Reminders, Health, Fitness, Shortcuts)",
+      "version": "0.1.0",
+      "category": "productivity",
+      "keywords": ["macos", "apple", "productivity", "calendar", "contacts", "mail", "messages", "reminders", "health", "fitness", "shortcuts", "applescript", "automation"],
+      "author": {
+        "name": "g-shudy",
+        "url": "https://ghsj.me"
+      }
     }
   ]
 }

@@ -1,0 +1,88 @@
+#!/bin/bash
+# calendar-list - List available Apple Calendar calendars
+
+set -euo pipefail
+
+show_help() {
+  cat <<EOF
+Usage: calendar-list
+
+List all available calendars in Apple Calendar.
+
+Options:
+  -h, --help           Show this help message
+  -j, --json           Output as JSON
+
+Examples:
+  calendar-list        # List all calendars
+  calendar-list -j     # JSON output
+
+Output format (default):
+  Calendar Name
+
+Exit codes:
+  0    Success
+  2    Error querying Calendar.app
+
+Notes:
+  • Does not require Calendar.app to be running
+  • Returns calendar names that can be used with calendar-add and calendar-events
+EOF
+}
+
+# Parse arguments
+JSON=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    -j|--json)
+      JSON=true
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+# Query Calendar.app for calendar list
+RESULT=$(osascript - 2>/dev/null <<'EOF' || echo "ERROR"
+tell application "Calendar"
+    set calList to {}
+    repeat with cal in calendars
+        set end of calList to name of cal
+    end repeat
+    return calList as text
+end tell
+EOF
+)
+
+# Handle errors
+if [[ "$RESULT" == "ERROR" ]]; then
+    echo "Error: Failed to query Calendar.app" >&2
+    exit 2
+fi
+
+# Format output
+if $JSON; then
+    echo '{"calendars": ['
+    FIRST=true
+    echo "$RESULT" | tr ', ' '\n' | while read -r cal; do
+        if [[ -n "$cal" ]]; then
+            if ! $FIRST; then
+                echo ","
+            fi
+            FIRST=false
+            echo -n "    \"$cal\""
+        fi
+    done
+    echo ""
+    echo "  ]}"
+else
+    echo "$RESULT" | tr ', ' '\n'
+fi

@@ -1,0 +1,161 @@
+#!/bin/bash
+# mail-unread - Get unread mail from Apple Mail
+# Returns unread messages from specified time window
+
+set -euo pipefail
+
+show_help() {
+  cat <<EOF
+Usage: mail-unread [hours]
+
+Get unread messages from Apple Mail within specified time window.
+
+Arguments:
+  [hours]              Hours to look back (default: 24)
+
+Options:
+  -h, --help           Show this help message
+  -d, --days DAYS      Look back N days instead of hours
+  -l, --limit N        Limit results to N messages (default: 15)
+  -j, --json           Output as JSON
+
+Examples:
+  mail-unread          # Unread from last 24 hours (default)
+  mail-unread 6        # Unread from last 6 hours
+  mail-unread -d 3     # Unread from last 3 days
+  mail-unread -l 5     # Only first 5 unread messages
+
+Output format (default):
+  Subject | From: sender@example.com
+
+Exit codes:
+  0    Success
+  1    Mail.app not running
+  2    Error querying Mail.app
+
+Notes:
+  • Mail.app must be running for queries to work
+  • Use --json for machine-readable output
+  • Large time windows may be slow
+EOF
+}
+
+# Parse arguments
+HOURS=24
+DAYS=""
+LIMIT=15
+JSON=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    -d|--days)
+      DAYS="$2"
+      shift 2
+      ;;
+    -l|--limit)
+      LIMIT="$2"
+      shift 2
+      ;;
+    -j|--json)
+      JSON=true
+      shift
+      ;;
+    [0-9]*)
+      HOURS="$1"
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+# Check if Mail.app is running
+if ! pgrep -x "Mail" > /dev/null; then
+    echo "Error: Mail.app not running" >&2
+    echo "Please open Mail.app before running this command" >&2
+    exit 1
+fi
+
+# Build AppleScript query
+if [[ -n "$DAYS" ]]; then
+    TIME_CALC="(current date) - ($DAYS * days)"
+else
+    TIME_CALC="(current date) - ($HOURS * hours)"
+fi
+
+# Query Mail.app
+RESULT=$(osascript - 2>/dev/null <<EOF || echo "ERROR"
+tell application "Mail"
+    set cutoffTime to $TIME_CALC
+    set unreadMessages to (every message of inbox whose read status is false and date received ≥ cutoffTime)
+
+    if (count of unreadMessages) = 0 then
+        return "NONE"
+    else
+        set mailList to {}
+        set counter to 0
+        repeat with msg in unreadMessages
+            set counter to counter + 1
+            if counter > $LIMIT then exit repeat
+            try
+                set mailInfo to (subject of msg as text) & "|" & (sender of msg as text) & "|" & (date received of msg as text)
+                set end of mailList to mailInfo
+            end try
+        end repeat
+
+        set AppleScript's text item delimiters to "||"
+        return mailList as text
+    end if
+end tell
+EOF
+)
+
+# Handle errors
+if [[ "$RESULT" == "ERROR" ]]; then
+    echo "Error: Failed to query Mail.app" >&2
+    exit 2
+fi
+
+# Handle no results
+if [[ "$RESULT" == "NONE" ]]; then
+    if $JSON; then
+        echo '{"count": 0, "messages": []}'
+    else
+        echo "No unread mail"
+    fi
+    exit 0
+fi
+
+# Format output
+if $JSON; then
+    echo '{"count": '$(echo "$RESULT" | tr '||' '\n' | wc -l | tr -d ' ')', "messages": ['
+
+    FIRST=true
+    echo "$RESULT" | tr '||' '\n' | while IFS='|' read -r subject sender date; do
+        if [[ -n "$subject" ]]; then
+            if $FIRST; then
+                FIRST=false
+            else
+                echo ","
+            fi
+            # Escape JSON special characters
+            subject=$(echo "$subject" | sed 's/"/\\"/g' | sed "s/'/\\'/g")
+            sender=$(echo "$sender" | sed 's/"/\\"/g' | sed "s/'/\\'/g")
+            echo -n "    {\"subject\": \"$subject\", \"from\": \"$sender\", \"date\": \"$date\"}"
+        fi
+    done
+    echo ""
+    echo "  ]}"
+else
+    echo "$RESULT" | tr '||' '\n' | while IFS='|' read -r subject sender date; do
+        if [[ -n "$subject" ]]; then
+            echo "$subject | From: $sender"
+        fi
+    done
+fi

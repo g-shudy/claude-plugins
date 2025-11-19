@@ -1,0 +1,235 @@
+#!/bin/bash
+# calendar-events - Query events from Apple Calendar
+
+set -euo pipefail
+
+show_help() {
+  cat <<EOF
+Usage: calendar-events [OPTIONS]
+
+Query events from Apple Calendar for specified date range.
+
+Options:
+  -d, --date DATE            Show events for specific date (YYYY-MM-DD)
+  -t, --today                Show today's events (default)
+  -w, --week                 Show this week's events
+  -r, --range START END      Show events between dates (YYYY-MM-DD format)
+  -c, --calendar NAME        Filter by calendar name
+  -j, --json                 Output as JSON
+  -h, --help                 Show this help message
+
+Examples:
+  calendar-events                           # Today's events (default)
+  calendar-events -t                        # Today's events
+  calendar-events -d 2025-11-15             # Events on Nov 15, 2025
+  calendar-events -w                        # This week's events
+  calendar-events -r 2025-11-15 2025-11-20  # Events Nov 15-20
+  calendar-events -c "Work"                 # Only Work calendar events
+
+Output format (default):
+  [HH:MM-HH:MM] Event Title @ Location (Calendar Name)
+
+Exit codes:
+  0    Success
+  1    Invalid arguments
+  2    Error querying Calendar.app
+  3    Timeout (query took too long)
+
+Notes:
+  • Large date ranges may be slow or timeout
+  • Default timeout: 10 seconds
+  • Use calendar-list to see available calendar names
+  • Times shown in 24-hour format
+
+Warning:
+  • Calendar queries can sometimes hang. If this happens, the script
+    will timeout after 10 seconds. Try a smaller date range.
+EOF
+}
+
+# Parse arguments
+DATE=""
+TODAY=false
+WEEK=false
+RANGE_START=""
+RANGE_END=""
+CALENDAR=""
+JSON=false
+TIMEOUT=10
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    -d|--date)
+      DATE="$2"
+      shift 2
+      ;;
+    -t|--today)
+      TODAY=true
+      shift
+      ;;
+    -w|--week)
+      WEEK=true
+      shift
+      ;;
+    -r|--range)
+      RANGE_START="$2"
+      RANGE_END="$3"
+      shift 3
+      ;;
+    -c|--calendar)
+      CALENDAR="$2"
+      shift 2
+      ;;
+    -j|--json)
+      JSON=true
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Determine date range
+if [[ -n "$DATE" ]]; then
+    # Specific date
+    START_DATE="$DATE"
+    END_DATE="$DATE"
+elif [[ "$WEEK" == true ]]; then
+    # This week (Monday to Sunday)
+    START_DATE=$(date -v Monday "+%Y-%m-%d")
+    END_DATE=$(date -v Sunday "+%Y-%m-%d")
+elif [[ -n "$RANGE_START" ]] && [[ -n "$RANGE_END" ]]; then
+    # Custom range
+    START_DATE="$RANGE_START"
+    END_DATE="$RANGE_END"
+else
+    # Default: today
+    START_DATE=$(date "+%Y-%m-%d")
+    END_DATE="$START_DATE"
+fi
+
+# Build AppleScript query
+APPLESCRIPT_QUERY="tell application \"Calendar\""
+
+if [[ -n "$CALENDAR" ]]; then
+    # Filter by specific calendar
+    CALENDAR_ESCAPED=$(echo "$CALENDAR" | sed "s/'/\\\\'/g")
+    APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
+    set targetCalendar to calendar \"$CALENDAR_ESCAPED\"
+    set calendarList to {targetCalendar}"
+else
+    # All calendars
+    APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
+    set calendarList to every calendar"
+fi
+
+APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
+    set startDate to date \"${START_DATE}T00:00:00\"
+    set endDate to date \"${END_DATE}T23:59:59\"
+    set eventList to {}
+
+    repeat with cal in calendarList
+        set calName to name of cal
+        set calEvents to (every event of cal whose start date ≥ startDate and start date ≤ endDate)
+
+        repeat with evt in calEvents
+            set eventInfo to (summary of evt as text) & \"|\" & (start date of evt as text) & \"|\" & (end date of evt as text) & \"|\" & calName
+            try
+                set eventInfo to eventInfo & \"|\" & (location of evt as text)
+            on error
+                set eventInfo to eventInfo & \"|\"
+            end try
+            try
+                set eventInfo to eventInfo & \"|\" & (description of evt as text)
+            on error
+                set eventInfo to eventInfo & \"|\"
+            end try
+            set end of eventList to eventInfo
+        end repeat
+    end repeat
+
+    if (count of eventList) = 0 then
+        return \"NONE\"
+    else
+        set AppleScript's text item delimiters to \"||\"
+        return eventList as text
+    end if
+end tell"
+
+# Run with timeout
+RESULT=$(timeout $TIMEOUT osascript -e "$APPLESCRIPT_QUERY" 2>&1 || echo "TIMEOUT")
+
+# Handle timeout
+if [[ "$RESULT" == "TIMEOUT" ]] || [[ "$RESULT" == *"timed out"* ]]; then
+    echo "Error: Query timed out after ${TIMEOUT}s" >&2
+    echo "Try a smaller date range or check if Calendar.app is responsive" >&2
+    exit 3
+fi
+
+# Handle errors
+if [[ "$RESULT" == *"error"* ]] && [[ "$RESULT" != "NONE" ]]; then
+    echo "Error: Failed to query Calendar.app" >&2
+    echo "$RESULT" >&2
+    exit 2
+fi
+
+# Handle no results
+if [[ "$RESULT" == "NONE" ]]; then
+    if $JSON; then
+        echo '{"count": 0, "events": []}'
+    else
+        echo "No events found for $START_DATE"
+        [[ "$START_DATE" != "$END_DATE" ]] && echo " to $END_DATE"
+    fi
+    exit 0
+fi
+
+# Format output
+if $JSON; then
+    EVENT_COUNT=$(echo "$RESULT" | tr '||' '\n' | wc -l | tr -d ' ')
+    echo '{"count": '"$EVENT_COUNT"', "events": ['
+
+    FIRST=true
+    echo "$RESULT" | tr '||' '\n' | while IFS='|' read -r title start_date end_date calendar location description; do
+        if [[ -n "$title" ]]; then
+            if ! $FIRST; then
+                echo ","
+            fi
+            FIRST=false
+
+            # Escape JSON
+            title=$(echo "$title" | sed 's/"/\\"/g')
+            calendar=$(echo "$calendar" | sed 's/"/\\"/g')
+            location=$(echo "$location" | sed 's/"/\\"/g')
+            description=$(echo "$description" | sed 's/"/\\"/g')
+
+            echo -n "    {\"title\": \"$title\", \"start\": \"$start_date\", \"end\": \"$end_date\", \"calendar\": \"$calendar\", \"location\": \"$location\", \"description\": \"$description\"}"
+        fi
+    done
+    echo ""
+    echo "  ]}"
+else
+    echo "Events for $START_DATE"
+    [[ "$START_DATE" != "$END_DATE" ]] && echo " to $END_DATE"
+    echo ""
+
+    echo "$RESULT" | tr '||' '\n' | while IFS='|' read -r title start_date end_date calendar location description; do
+        if [[ -n "$title" ]]; then
+            # Extract time from date string
+            start_time=$(date -j -f "%A, %B %d, %Y at %I:%M:%S %p" "$start_date" "+%H:%M" 2>/dev/null || echo "??:??")
+            end_time=$(date -j -f "%A, %B %d, %Y at %I:%M:%S %p" "$end_date" "+%H:%M" 2>/dev/null || echo "??:??")
+
+            echo "[$start_time-$end_time] $title"
+            [[ -n "$location" ]] && echo "    @ $location"
+            echo "    ($calendar)"
+            [[ -n "$description" ]] && echo "    Note: $description"
+            echo ""
+        fi
+    done
+fi

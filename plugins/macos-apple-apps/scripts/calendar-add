@@ -1,0 +1,186 @@
+#!/bin/bash
+# calendar-add - Add event to Apple Calendar using ISO-8601 format
+
+set -euo pipefail
+
+show_help() {
+  cat <<EOF
+Usage: calendar-add [OPTIONS]
+
+Add an event to Apple Calendar.
+
+Required Options:
+  -t, --title TITLE          Event title/summary
+  -s, --start DATETIME       Start datetime (ISO-8601: YYYY-MM-DDTHH:MM:SS)
+  -e, --end DATETIME         End datetime (ISO-8601: YYYY-MM-DDTHH:MM:SS)
+
+Optional:
+  -c, --calendar NAME        Calendar name (default: "Me")
+  -l, --location LOCATION    Event location
+  -d, --description DESC     Event description/notes
+  -h, --help                 Show this help message
+
+Examples:
+  # Simple event
+  calendar-add -t "Lunch with John" -s 2025-11-15T12:00:00 -e 2025-11-15T13:00:00
+
+  # Full event with all details
+  calendar-add \\
+    -t "Team Meeting" \\
+    -s 2025-11-15T14:00:00 \\
+    -e 2025-11-15T15:30:00 \\
+    -l "Conference Room A" \\
+    -d "Discuss Q4 planning" \\
+    -c "Work"
+
+  # All-day event (use 00:00:00 times)
+  calendar-add -t "Vacation" -s 2025-12-20T00:00:00 -e 2025-12-27T00:00:00
+
+ISO-8601 DateTime Format:
+  YYYY-MM-DDTHH:MM:SS
+  Example: 2025-11-15T14:30:00 = Nov 15, 2025 at 2:30 PM
+
+  • YYYY = 4-digit year
+  • MM = 2-digit month (01-12)
+  • DD = 2-digit day (01-31)
+  • T = separator (literal "T")
+  • HH = 2-digit hour in 24-hour format (00-23)
+  • MM = 2-digit minute (00-59)
+  • SS = 2-digit second (00-59)
+
+Exit codes:
+  0    Success (returns event ID)
+  1    Missing required arguments
+  2    Error creating event
+
+Notes:
+  • Use calendar-list to see available calendars
+  • Default calendar is "Me" if not specified
+  • Hours are 24-hour format (14 = 2 PM, 09 = 9 AM)
+  • Start datetime must be before end datetime
+EOF
+}
+
+# Parse arguments
+TITLE=""
+START=""
+END=""
+CALENDAR="Me"
+LOCATION=""
+DESCRIPTION=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    -t|--title)
+      TITLE="$2"
+      shift 2
+      ;;
+    -s|--start)
+      START="$2"
+      shift 2
+      ;;
+    -e|--end)
+      END="$2"
+      shift 2
+      ;;
+    -c|--calendar)
+      CALENDAR="$2"
+      shift 2
+      ;;
+    -l|--location)
+      LOCATION="$2"
+      shift 2
+      ;;
+    -d|--description)
+      DESCRIPTION="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Validate required arguments
+if [[ -z "$TITLE" ]]; then
+    echo "Error: Missing required argument: --title" >&2
+    echo "Run 'calendar-add --help' for usage" >&2
+    exit 1
+fi
+
+if [[ -z "$START" ]]; then
+    echo "Error: Missing required argument: --start" >&2
+    echo "Run 'calendar-add --help' for usage" >&2
+    exit 1
+fi
+
+if [[ -z "$END" ]]; then
+    echo "Error: Missing required argument: --end" >&2
+    echo "Run 'calendar-add --help' for usage" >&2
+    exit 1
+fi
+
+# Validate ISO-8601 format (basic check)
+if ! [[ "$START" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+    echo "Error: Invalid start datetime format. Expected ISO-8601: YYYY-MM-DDTHH:MM:SS" >&2
+    echo "Example: 2025-11-15T14:30:00" >&2
+    exit 1
+fi
+
+if ! [[ "$END" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+    echo "Error: Invalid end datetime format. Expected ISO-8601: YYYY-MM-DDTHH:MM:SS" >&2
+    echo "Example: 2025-11-15T15:30:00" >&2
+    exit 1
+fi
+
+# Escape single quotes in strings for AppleScript
+TITLE_ESCAPED=$(echo "$TITLE" | sed "s/'/\\\\'/g")
+CALENDAR_ESCAPED=$(echo "$CALENDAR" | sed "s/'/\\\\'/g")
+LOCATION_ESCAPED=$(echo "$LOCATION" | sed "s/'/\\\\'/g")
+DESCRIPTION_ESCAPED=$(echo "$DESCRIPTION" | sed "s/'/\\\\'/g")
+
+# Build AppleScript properties
+PROPERTIES="summary:\"$TITLE_ESCAPED\", start date:date \"$START\", end date:date \"$END\""
+
+if [[ -n "$LOCATION" ]]; then
+    PROPERTIES="$PROPERTIES, location:\"$LOCATION_ESCAPED\""
+fi
+
+if [[ -n "$DESCRIPTION" ]]; then
+    PROPERTIES="$PROPERTIES, description:\"$DESCRIPTION_ESCAPED\""
+fi
+
+# Create event via AppleScript
+RESULT=$(osascript - 2>&1 <<EOF || echo "ERROR"
+tell application "Calendar"
+    tell calendar "$CALENDAR_ESCAPED"
+        set newEvent to make new event with properties {$PROPERTIES}
+        return id of newEvent
+    end tell
+end tell
+EOF
+)
+
+# Handle errors
+if [[ "$RESULT" == "ERROR" ]] || [[ "$RESULT" == *"error"* ]]; then
+    echo "Error: Failed to create event" >&2
+    echo "$RESULT" >&2
+    exit 2
+fi
+
+# Success - return event ID
+echo "✓ Event created successfully"
+echo "Event ID: $RESULT"
+echo ""
+echo "Details:"
+echo "  Title: $TITLE"
+echo "  Start: $START"
+echo "  End: $END"
+echo "  Calendar: $CALENDAR"
+[[ -n "$LOCATION" ]] && echo "  Location: $LOCATION"
+[[ -n "$DESCRIPTION" ]] && echo "  Description: $DESCRIPTION"

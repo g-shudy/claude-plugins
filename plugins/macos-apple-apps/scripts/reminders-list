@@ -1,0 +1,283 @@
+#!/bin/bash
+# reminders-list - Query reminders from Apple Reminders
+
+set -euo pipefail
+
+show_help() {
+  cat <<EOF
+Usage: reminders-list [OPTIONS]
+
+Query reminders from Apple Reminders app.
+
+Options:
+  -h, --help                 Show this help message
+  -a, --all                  Show all reminders (default: incomplete only)
+  -c, --completed            Show only completed reminders
+  -l, --list NAME            Filter by reminder list name
+  -d, --due-today            Show reminders due today
+  -o, --overdue              Show overdue reminders
+  -j, --json                 Output as JSON
+  --limit N                  Limit results to N reminders (default: 50)
+
+Examples:
+  reminders-list                        # Incomplete reminders (default)
+  reminders-list -a                     # All reminders
+  reminders-list -c                     # Only completed
+  reminders-list -d                     # Due today
+  reminders-list -o                     # Overdue
+  reminders-list -l "Work"              # Only "Work" list
+  reminders-list -l "Work" -d           # Work reminders due today
+
+Output format (default):
+  [ ] Title (List Name) [Due: YYYY-MM-DD]
+  [✓] Title (List Name) [Completed: YYYY-MM-DD]
+
+Exit codes:
+  0    Success
+  1    Invalid arguments
+  2    Error querying Reminders.app
+  3    Timeout (query took too long)
+
+Notes:
+  • Reminders queries can sometimes hang. If this happens, the script
+    will timeout after 10 seconds.
+  • [ ] = incomplete, [✓] = completed
+  • Use --list to filter by specific reminder list
+
+Warning:
+  • Similar to Calendar, Reminders queries can hang. The script will
+    timeout after 10 seconds. If this occurs frequently, use the
+    Reminders.app directly.
+EOF
+}
+
+# Parse arguments
+ALL=false
+COMPLETED_ONLY=false
+LIST=""
+DUE_TODAY=false
+OVERDUE=false
+JSON=false
+LIMIT=50
+TIMEOUT=10
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    -a|--all)
+      ALL=true
+      shift
+      ;;
+    -c|--completed)
+      COMPLETED_ONLY=true
+      shift
+      ;;
+    -l|--list)
+      LIST="$2"
+      shift 2
+      ;;
+    -d|--due-today)
+      DUE_TODAY=true
+      shift
+      ;;
+    -o|--overdue)
+      OVERDUE=true
+      shift
+      ;;
+    -j|--json)
+      JSON=true
+      shift
+      ;;
+    --limit)
+      LIMIT="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Build AppleScript query
+LIST_ESCAPED=$(echo "$LIST" | sed "s/'/\\\\'/g")
+
+APPLESCRIPT_QUERY="tell application \"Reminders\"
+    set today to current date
+    set hours of today to 0
+    set minutes of today to 0
+    set seconds of today to 0
+
+    set reminderList to {}"
+
+if [[ -n "$LIST" ]]; then
+    APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
+    set targetList to list \"$LIST_ESCAPED\"
+    set allReminders to reminders of targetList"
+else
+    APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
+    set allReminders to every reminder"
+fi
+
+APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
+    set counter to 0
+
+    repeat with aReminder in allReminders
+        set counter to counter + 1
+        if counter > $LIMIT then exit repeat
+
+        set reminderName to name of aReminder
+        set reminderCompleted to completed of aReminder
+
+        try
+            set reminderListName to name of container of aReminder
+        on error
+            set reminderListName to \"(No list)\"
+        end try
+
+        try
+            set reminderDueDate to due date of aReminder
+        on error
+            set reminderDueDate to missing value
+        end try
+
+        try
+            set reminderCompletionDate to completion date of aReminder
+        on error
+            set reminderCompletionDate to missing value
+        end try"
+
+if [[ "$ALL" == false ]]; then
+    if [[ "$COMPLETED_ONLY" == true ]]; then
+        APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
+        if not reminderCompleted then
+            -- Skip incomplete reminders
+        else"
+    else
+        APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
+        if reminderCompleted then
+            -- Skip completed reminders
+        else"
+    fi
+fi
+
+if [[ "$DUE_TODAY" == true ]]; then
+    APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
+            if reminderDueDate is not missing value then
+                if reminderDueDate ≥ today and reminderDueDate < (today + 1 * days) then"
+elif [[ "$OVERDUE" == true ]]; then
+    APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
+            if reminderDueDate is not missing value then
+                if reminderDueDate < today then"
+fi
+
+APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
+                    set reminderInfo to reminderName & \"|\" & reminderCompleted & \"|\" & reminderListName & \"|\"
+
+                    if reminderDueDate is not missing value then
+                        set reminderInfo to reminderInfo & (reminderDueDate as text)
+                    else
+                        set reminderInfo to reminderInfo & \"\"
+                    end if
+
+                    set reminderInfo to reminderInfo & \"|\"
+
+                    if reminderCompletionDate is not missing value then
+                        set reminderInfo to reminderInfo & (reminderCompletionDate as text)
+                    else
+                        set reminderInfo to reminderInfo & \"\"
+                    end if
+
+                    set end of reminderList to reminderInfo"
+
+if [[ "$DUE_TODAY" == true ]] || [[ "$OVERDUE" == true ]]; then
+    APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
+                end if
+            end if"
+fi
+
+if [[ "$ALL" == false ]]; then
+    APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
+        end if"
+fi
+
+APPLESCRIPT_QUERY="$APPLESCRIPT_QUERY
+    end repeat
+
+    if (count of reminderList) = 0 then
+        return \"NONE\"
+    else
+        set AppleScript's text item delimiters to \"||\"
+        return reminderList as text
+    end if
+end tell"
+
+# Run with timeout
+RESULT=$(timeout $TIMEOUT osascript -e "$APPLESCRIPT_QUERY" 2>&1 || echo "TIMEOUT")
+
+# Handle timeout
+if [[ "$RESULT" == "TIMEOUT" ]] || [[ "$RESULT" == *"timed out"* ]]; then
+    echo "Error: Query timed out after ${TIMEOUT}s" >&2
+    echo "Try using Reminders.app directly or specify a list with -l" >&2
+    exit 3
+fi
+
+# Handle errors
+if [[ "$RESULT" == *"error"* ]] && [[ "$RESULT" != "NONE" ]]; then
+    echo "Error: Failed to query Reminders.app" >&2
+    echo "$RESULT" >&2
+    exit 2
+fi
+
+# Handle no results
+if [[ "$RESULT" == "NONE" ]]; then
+    if $JSON; then
+        echo '{"count": 0, "reminders": []}'
+    else
+        echo "No reminders found"
+    fi
+    exit 0
+fi
+
+# Format output
+if $JSON; then
+    REMINDER_COUNT=$(echo "$RESULT" | tr '||' '\n' | wc -l | tr -d ' ')
+    echo '{"count": '"$REMINDER_COUNT"', "reminders": ['
+
+    FIRST=true
+    echo "$RESULT" | tr '||' '\n' | while IFS='|' read -r title completed list_name due_date completion_date; do
+        if [[ -n "$title" ]]; then
+            if ! $FIRST; then
+                echo ","
+            fi
+            FIRST=false
+
+            # Escape JSON
+            title=$(echo "$title" | sed 's/"/\\"/g')
+            list_name=$(echo "$list_name" | sed 's/"/\\"/g')
+
+            echo -n "    {\"title\": \"$title\", \"completed\": $completed, \"list\": \"$list_name\", \"due_date\": \"$due_date\", \"completion_date\": \"$completion_date\"}"
+        fi
+    done
+    echo ""
+    echo "  ]}"
+else
+    REMINDER_COUNT=$(echo "$RESULT" | tr '||' '\n' | wc -l | tr -d ' ')
+    echo "Found $REMINDER_COUNT reminders"
+    echo ""
+
+    echo "$RESULT" | tr '||' '\n' | while IFS='|' read -r title completed list_name due_date completion_date; do
+        if [[ -n "$title" ]]; then
+            if [[ "$completed" == "true" ]]; then
+                echo "[✓] $title ($list_name)"
+                [[ -n "$completion_date" ]] && echo "    Completed: $completion_date"
+            else
+                echo "[ ] $title ($list_name)"
+                [[ -n "$due_date" ]] && echo "    Due: $due_date"
+            fi
+        fi
+    done
+fi
