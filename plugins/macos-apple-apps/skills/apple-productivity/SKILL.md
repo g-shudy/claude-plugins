@@ -86,6 +86,31 @@ imessage-recent -j           # JSON output
 - `>>move:`, `>>archive`, `>>defer:`
 - `[MUST]`, `[SHOULD]`
 
+**`imessage-search`** - Advanced iMessage search with full message history (SQLite + attributedBody decoding)
+```bash
+imessage-search --felicitations                 # Find birthday/holiday/congrats messages
+imessage-search --pattern "lunch"               # Search for custom keyword
+imessage-search --keywords "meeting,call"       # Multiple keywords (comma-separated)
+imessage-search --felicitations -l 10           # Limit to 10 contacts
+imessage-search --pattern "resume" --csv        # CSV output
+imessage-search --felicitations -o ~/Desktop/contacts.csv  # Save to file
+```
+
+**Key Features**:
+- Searches **complete message history** (not just recent messages)
+- Decodes modern iMessage `attributedBody` BLOB format (binary plist)
+- Groups results by contact with message counts and dates
+- Auto-installs dependencies on first run (creates venv with biplist)
+- Supports JSON, CSV, and human-readable output formats
+
+**Use Cases**:
+- Find contacts you've sent felicitation messages to (birthdays, holidays, congratulations)
+- Search historical messages for specific keywords or topics
+- Build contact lists for holiday greetings
+- Analyze message patterns over time
+
+**Note**: First run takes ~10s to setup virtual environment and install dependencies. Subsequent runs are fast.
+
 ### Reminders
 
 **`reminders-list`** - Query reminders
@@ -141,6 +166,12 @@ imessage-recent -p "resume"
 
 # Check for user directives
 imessage-recent -n
+
+# Historical search across all messages
+imessage-search --pattern "resume"
+
+# Find contacts for holiday greetings
+imessage-search --felicitations --csv -o ~/Desktop/thanksgiving-contacts.csv
 ```
 
 ## Security & Privacy
@@ -150,7 +181,8 @@ imessage-recent -n
 - ✅ Viewing calendar events
 - ✅ Looking up contacts
 - ✅ Checking unread mail counts/subjects
-- ✅ Reading recent iMessages
+- ✅ Reading recent iMessages (`imessage-recent`)
+- ✅ Searching historical iMessages (`imessage-search`)
 - ✅ Querying reminder status
 
 ### WRITE OPERATIONS (ALWAYS Ask User First)
@@ -253,7 +285,10 @@ calendar-add -t "Lunch" -s 2025-11-16T12:00:00 -e 2025-11-16T13:00:00
 - **Mail**: Requires Mail.app to be running
 - **Calendar**: Large date ranges (years) may timeout - use smaller ranges
 - **Reminders**: Large lists may timeout - filter by specific list
-- **Messages**: Read-only via AppleScript (send requires user interaction)
+- **Messages**:
+  - `imessage-recent`: Only searches messages with plain text field (~70 messages) - fast but limited
+  - `imessage-search`: Searches complete history by decoding attributedBody BLOBs - comprehensive but slower
+  - Sending messages requires user interaction (read-only access)
 - **Contacts**: ~700 contacts can be slow to enumerate - use specific searches
 
 ## Tips
