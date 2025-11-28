@@ -1,7 +1,7 @@
 {
   "name": "macos-apple-apps",
   "version": "0.1.0",
-  "description": "Claude Code integration with macOS Apple productivity apps (Calendar, Contacts, Mail, Messages, Reminders, Health, Fitness, Shortcuts)",
+  "description": "Claude Code integration with macOS Apple productivity apps (Calendar, Contacts, Mail, Messages, Reminders, Health, Fitness, Shortcuts, Photos)",
   "author": {
     "name": "g-shudy",
     "url": "https://ghsj.me"
@@ -20,6 +20,7 @@
     "health",
     "fitness",
     "shortcuts",
+    "photos",
     "applescript",
     "automation"
   ]
