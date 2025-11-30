@@ -1,6 +1,6 @@
 ---
 name: apple-productivity
-description: Access macOS Apple productivity apps (Calendar, Contacts, Mail, Messages, Reminders) to read events, contacts, messages, and tasks. Use this when user needs to check calendar, look up contacts, read messages/emails, or query reminders.
+description: Access macOS Apple productivity apps (Calendar, Contacts, Mail, Messages, Reminders, Voice Memos) to read events, contacts, messages, and tasks. Use when user asks about calendar, contacts, messages/emails, reminders, or voice memo transcription.
 allowed-tools:
   - Bash
   - Read
@@ -127,6 +127,38 @@ reminders-list -j                     # JSON output
 ```
 
 **Warning**: Large queries can timeout (10s limit). Use `-l` to filter by specific list if needed.
+
+### Voice Memos
+
+**`voice-memos`** - Transcribe Apple Voice Memos with speaker diarization
+```bash
+voice-memos list                 # Show unprocessed memos
+voice-memos list --all           # Show all memos (including processed)
+voice-memos process              # Auto-process (prioritizes recent)
+voice-memos process --dry-run    # Preview what would be processed
+voice-memos transcribe <file>    # Transcribe specific memo
+voice-memos stats                # Show usage/cost statistics
+```
+
+**Features**:
+- Reads from Apple's synced Voice Memos database (iCloud)
+- Speaker diarization (identifies multiple speakers)
+- Key phrase extraction
+- Cost tracking (~$0.0025/min via AssemblyAI)
+
+**Output**:
+- Transcripts saved to `~/Vault/Voice-Transcripts/`
+- Markdown format with speaker labels and timestamps
+
+**Databases**:
+- Apple source: `~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings/CloudRecordings.db`
+- Tracking: `~/.voice-memos.db` (processed, usage, skipped tables)
+
+**Requirements**:
+- `ASSEMBLYAI_API_KEY` environment variable
+- Python package: `pip install assemblyai`
+
+**Note**: Processing incurs costs (~$0.15/hour). Use `stats` to check balance.
 
 ## Common Patterns
 

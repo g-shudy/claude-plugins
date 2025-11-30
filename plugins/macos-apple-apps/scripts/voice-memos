@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""
+voice-memos - Process Voice Memos with AssemblyAI transcription
+
+Commands:
+    list        Show unprocessed voice memos
+    transcribe  Transcribe specific memo(s)
+    process     Auto-process (today/yesterday first, then oldest)
+    stats       Show usage statistics
+
+Usage:
+    voice-memos list [--all]
+    voice-memos transcribe <file_or_id>...
+    voice-memos process [--minutes N] [--dry-run]
+    voice-memos stats
+"""
+
+import argparse
+import os
+import sqlite3
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# AssemblyAI SDK
+try:
+    import assemblyai as aai
+except ImportError:
+    print("Error: assemblyai package not installed")
+    print("Run: pip install assemblyai")
+    sys.exit(1)
+
+# Paths
+VOICE_MEMOS_DIR = Path.home() / "Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings"
+VOICE_MEMOS_DB = VOICE_MEMOS_DIR / "CloudRecordings.db"
+TRACKING_DB = Path.home() / ".voice-memos.db"
+TRANSCRIPTS_DIR = Path.home() / "Vault/Voice-Transcripts"
+VAULT_ATTACHMENTS = Path.home() / "Vault/.attachments/voice"
+
+# Cost per second (AssemblyAI Universal: $0.15/hr = $0.0025/min = $0.0000417/sec)
+COST_PER_SECOND = 0.0000417
+
+# Apple's Core Data epoch offset (2001-01-01 vs 1970-01-01)
+APPLE_EPOCH_OFFSET = 978307200
+
+
+def init_tracking_db():
+    """Initialize the tracking database."""
+    conn = sqlite3.connect(TRACKING_DB)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS processed (
+            id INTEGER PRIMARY KEY,
+            voice_memo_id TEXT UNIQUE,
+            filename TEXT,
+            processed_at TEXT,
+            audio_duration_sec REAL,
+            transcript_path TEXT,
+            assemblyai_id TEXT,
+            deleted_from_api INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS usage (
+            id INTEGER PRIMARY KEY,
+            date TEXT,
+            duration_sec REAL,
+            cost_usd REAL,
+            memo_count INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS skipped (
+            id INTEGER PRIMARY KEY,
+            voice_memo_id TEXT UNIQUE,
+            filename TEXT,
+            skipped_at TEXT,
+            reason TEXT,
+            fail_count INTEGER DEFAULT 1
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def get_skipped_ids(tracking_conn):
+    """Get set of skipped memo IDs."""
+    cursor = tracking_conn.execute("SELECT voice_memo_id FROM skipped")
+    return {row[0] for row in cursor}
+
+
+def mark_as_skipped(tracking_conn, memo, reason):
+    """Mark a memo as skipped due to persistent failure."""
+    tracking_conn.execute("""
+        INSERT INTO skipped (voice_memo_id, filename, skipped_at, reason, fail_count)
+        VALUES (?, ?, ?, ?, 1)
+        ON CONFLICT(voice_memo_id) DO UPDATE SET
+            fail_count = fail_count + 1,
+            reason = excluded.reason
+    """, (memo['id'], memo['path'], datetime.now().isoformat(), reason))
+    tracking_conn.commit()
+
+
+def get_voice_memos_from_apple_db():
+    """Read voice memos from Apple's CloudRecordings database."""
+    if not VOICE_MEMOS_DB.exists():
+        print(f"Error: Voice Memos database not found at {VOICE_MEMOS_DB}")
+        sys.exit(1)
+
+    conn = sqlite3.connect(f"file:{VOICE_MEMOS_DB}?mode=ro", uri=True)
+    cursor = conn.execute("""
+        SELECT
+            ZUNIQUEID,
+            ZPATH,
+            ZCUSTOMLABEL,
+            datetime(ZDATE + ?, 'unixepoch', 'localtime') as recording_date,
+            ZDATE + ? as epoch_time,
+            ZDURATION
+        FROM ZCLOUDRECORDING
+        WHERE ZPATH IS NOT NULL
+        ORDER BY ZDATE DESC
+    """, (APPLE_EPOCH_OFFSET, APPLE_EPOCH_OFFSET))
+
+    memos = []
+    for row in cursor:
+        unique_id, path, label, date_str, epoch, duration = row
+        file_path = VOICE_MEMOS_DIR / path
+        if file_path.exists() and file_path.stat().st_size > 0:
+            memos.append({
+                'id': unique_id,
+                'path': path,
+                'file_path': file_path,
+                'label': label or path,
+                'date': date_str,
+                'epoch': epoch,
+                'duration': duration or 0
+            })
+    conn.close()
+    return memos
+
+
+def get_processed_ids(tracking_conn):
+    """Get set of already-processed memo IDs."""
+    cursor = tracking_conn.execute("SELECT voice_memo_id FROM processed")
+    return {row[0] for row in cursor}
+
+
+def format_duration(seconds):
+    """Format seconds as MM:SS or HH:MM:SS."""
+    if seconds is None:
+        return "??:??"
+    seconds = int(seconds)
+    if seconds >= 3600:
+        h, remainder = divmod(seconds, 3600)
+        m, s = divmod(remainder, 60)
+        return f"{h}:{m:02d}:{s:02d}"
+    m, s = divmod(seconds, 60)
+    return f"{m}:{s:02d}"
+
+
+def cmd_list(args, tracking_conn):
+    """List voice memos."""
+    memos = get_voice_memos_from_apple_db()
+    processed_ids = get_processed_ids(tracking_conn)
+    skipped_ids = get_skipped_ids(tracking_conn)
+
+    if not args.all:
+        memos = [m for m in memos if m['id'] not in processed_ids and m['id'] not in skipped_ids]
+
+    if not memos:
+        print("No unprocessed voice memos found.")
+        return
+
+    total_duration = 0
+    print(f"\n{'Date':<20} {'Duration':<10} {'Label'}")
+    print("-" * 70)
+
+    for memo in memos:
+        is_processed = memo['id'] in processed_ids
+        marker = " [done]" if is_processed else ""
+        duration_str = format_duration(memo['duration'])
+        total_duration += memo['duration'] or 0
+
+        # Truncate label for display
+        label = memo['label'][:40] + "..." if len(memo['label']) > 43 else memo['label']
+        print(f"{memo['date']:<20} {duration_str:<10} {label}{marker}")
+
+    print("-" * 70)
+    unprocessed = len([m for m in memos if m['id'] not in processed_ids])
+    print(f"Total: {len(memos)} memos, {unprocessed} unprocessed")
+    print(f"Total duration: {format_duration(total_duration)} (~${total_duration * COST_PER_SECOND:.2f} to transcribe)")
+
+
+def transcribe_memo(memo, tracking_conn, delete_after=True):
+    """Transcribe a single voice memo using AssemblyAI."""
+    api_key = os.environ.get('ASSEMBLYAI_API_KEY')
+    if not api_key:
+        print("Error: ASSEMBLYAI_API_KEY not set")
+        sys.exit(1)
+
+    aai.settings.api_key = api_key
+
+    print(f"  Uploading: {memo['path']}...")
+
+    config = aai.TranscriptionConfig(
+        speaker_labels=True,
+        auto_highlights=True,
+    )
+
+    transcriber = aai.Transcriber()
+
+    try:
+        transcript = transcriber.transcribe(str(memo['file_path']), config=config)
+
+        if transcript.status == aai.TranscriptStatus.error:
+            error_str = str(transcript.error)
+            print(f"  Error: {error_str}")
+
+            # Auto-skip files with persistent/unrecoverable errors
+            skip_patterns = [
+                "validation error",
+                "Upload failed",
+                "does not appear to contain audio",
+                "Transcoding failed",
+            ]
+            if any(pattern.lower() in error_str.lower() for pattern in skip_patterns):
+                mark_as_skipped(tracking_conn, memo, error_str[:200])
+                print(f"  → Marked as skipped (won't retry)")
+
+            return None
+
+        # Get actual duration from API (in seconds)
+        audio_duration = transcript.audio_duration or memo['duration']
+
+        # Create transcript markdown
+        transcript_content = create_transcript_markdown(memo, transcript)
+
+        # Save transcript
+        TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+        date_prefix = memo['date'][:10].replace('-', '-')  # YYYY-MM-DD
+        safe_label = "".join(c for c in memo['label'][:30] if c.isalnum() or c in ' -_').strip()
+        transcript_filename = f"{date_prefix} - {safe_label or 'Voice Memo'}.md"
+        transcript_path = TRANSCRIPTS_DIR / transcript_filename
+
+        # Handle duplicate filenames
+        counter = 1
+        while transcript_path.exists():
+            transcript_filename = f"{date_prefix} - {safe_label or 'Voice Memo'} ({counter}).md"
+            transcript_path = TRANSCRIPTS_DIR / transcript_filename
+            counter += 1
+
+        transcript_path.write_text(transcript_content)
+
+        # Record in tracking database
+        tracking_conn.execute("""
+            INSERT INTO processed (voice_memo_id, filename, processed_at, audio_duration_sec,
+                                   transcript_path, assemblyai_id, deleted_from_api)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            memo['id'],
+            memo['path'],
+            datetime.now().isoformat(),
+            audio_duration,
+            str(transcript_path),
+            transcript.id,
+            0
+        ))
+
+        # Update daily usage
+        today = datetime.now().strftime('%Y-%m-%d')
+        cost = audio_duration * COST_PER_SECOND
+        tracking_conn.execute("""
+            INSERT INTO usage (date, duration_sec, cost_usd, memo_count)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(date) DO UPDATE SET
+                duration_sec = duration_sec + excluded.duration_sec,
+                cost_usd = cost_usd + excluded.cost_usd,
+                memo_count = memo_count + 1
+        """, (today, audio_duration, cost))
+
+        tracking_conn.commit()
+
+        # Delete from AssemblyAI if requested
+        if delete_after:
+            try:
+                aai.Transcript.delete_by_id(transcript.id)
+                tracking_conn.execute(
+                    "UPDATE processed SET deleted_from_api = 1 WHERE assemblyai_id = ?",
+                    (transcript.id,)
+                )
+                tracking_conn.commit()
+            except Exception as e:
+                print(f"  Warning: Could not delete from API: {e}")
+
+        print(f"  Done: {format_duration(audio_duration)} transcribed (${cost:.3f})")
+        print(f"  Saved: {transcript_path.name}")
+
+        return transcript_path
+
+    except Exception as e:
+        error_str = str(e)
+        print(f"  Error: {e}")
+
+        # Auto-skip files with persistent/unrecoverable errors
+        skip_patterns = [
+            "validation error",
+            "Upload failed",
+            "does not appear to contain audio",
+            "Transcoding failed",
+        ]
+        if any(pattern.lower() in error_str.lower() for pattern in skip_patterns):
+            mark_as_skipped(tracking_conn, memo, error_str[:200])
+            print(f"  → Marked as skipped (won't retry)")
+
+        return None
+
+
+def create_transcript_markdown(memo, transcript):
+    """Create markdown content for the transcript."""
+    lines = [
+        f"# Voice Memo - {memo['date'][:16]}",
+        "",
+        f"**Duration**: {format_duration(transcript.audio_duration)}",
+        f"**Original File**: {memo['path']}",
+    ]
+
+    if memo['label'] and memo['label'] != memo['path']:
+        lines.append(f"**Label**: {memo['label']}")
+
+    # Speaker count
+    if transcript.utterances:
+        speakers = set(u.speaker for u in transcript.utterances)
+        lines.append(f"**Speakers**: {len(speakers)} identified")
+
+    lines.extend(["", "---", "", "## Transcript", ""])
+
+    # Use utterances if available (with speaker labels), otherwise plain text
+    if transcript.utterances:
+        for utterance in transcript.utterances:
+            start_time = format_duration(utterance.start / 1000)
+            lines.append(f"**Speaker {utterance.speaker}** ({start_time}): {utterance.text}")
+            lines.append("")
+    else:
+        lines.append(transcript.text or "(No text transcribed)")
+
+    # Auto highlights
+    if transcript.auto_highlights and transcript.auto_highlights.results:
+        lines.extend(["---", "", "## Key Phrases", ""])
+        for highlight in transcript.auto_highlights.results[:10]:
+            lines.append(f"- {highlight.text}")
+
+    lines.extend(["", "---", f"*Transcribed {datetime.now().strftime('%Y-%m-%d %H:%M')} via AssemblyAI*"])
+
+    return "\n".join(lines)
+
+
+def cmd_transcribe(args, tracking_conn):
+    """Transcribe specific memo(s)."""
+    memos = get_voice_memos_from_apple_db()
+    processed_ids = get_processed_ids(tracking_conn)
+
+    for target in args.files:
+        # Find matching memo by filename or ID
+        matches = [m for m in memos if target in m['path'] or target in m['id']]
+
+        if not matches:
+            print(f"Not found: {target}")
+            continue
+
+        for memo in matches:
+            if memo['id'] in processed_ids and not args.force:
+                print(f"Already processed: {memo['path']} (use --force to re-transcribe)")
+                continue
+
+            print(f"\nTranscribing: {memo['label']}")
+            transcribe_memo(memo, tracking_conn, delete_after=not args.keep)
+
+
+def cmd_process(args, tracking_conn):
+    """Auto-process memos with prioritization strategy."""
+    memos = get_voice_memos_from_apple_db()
+    processed_ids = get_processed_ids(tracking_conn)
+    skipped_ids = get_skipped_ids(tracking_conn)
+    unprocessed = [m for m in memos if m['id'] not in processed_ids and m['id'] not in skipped_ids]
+
+    if not unprocessed:
+        print("All voice memos have been processed!")
+        return
+
+    # Separate today/yesterday from older
+    now = datetime.now()
+    today = now.strftime('%Y-%m-%d')
+    yesterday = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    priority_memos = []
+    older_memos = []
+
+    for memo in unprocessed:
+        memo_date = memo['date'][:10]
+        if memo_date in (today, yesterday):
+            priority_memos.append(memo)
+        else:
+            older_memos.append(memo)
+
+    # Sort older memos oldest-first for catch-up
+    older_memos.sort(key=lambda m: m['epoch'])
+
+    # Calculate how many minutes to process
+    minutes_limit = args.minutes or 30  # Default 30 minutes
+    seconds_limit = minutes_limit * 60
+
+    # Build queue: priority first, then fill with oldest
+    queue = priority_memos.copy()
+    priority_duration = sum(m['duration'] or 0 for m in priority_memos)
+
+    # Add older memos to fill remaining time
+    remaining_seconds = seconds_limit - priority_duration
+    for memo in older_memos:
+        if remaining_seconds <= 0:
+            break
+        queue.append(memo)
+        remaining_seconds -= (memo['duration'] or 0)
+
+    if not queue:
+        print("No memos to process within time limit.")
+        return
+
+    total_duration = sum(m['duration'] or 0 for m in queue)
+    estimated_cost = total_duration * COST_PER_SECOND
+
+    print(f"\nProcessing queue:")
+    print(f"  Priority (today/yesterday): {len(priority_memos)} memos")
+    print(f"  Backlog (oldest first): {len(queue) - len(priority_memos)} memos")
+    print(f"  Total duration: {format_duration(total_duration)}")
+    print(f"  Estimated cost: ${estimated_cost:.2f}")
+    print()
+
+    if args.dry_run:
+        print("Dry run - would process:")
+        for memo in queue:
+            print(f"  {memo['date'][:10]} {format_duration(memo['duration'])} {memo['label'][:40]}")
+        return
+
+    # Process the queue
+    for i, memo in enumerate(queue, 1):
+        print(f"\n[{i}/{len(queue)}] {memo['label'][:50]}")
+        transcribe_memo(memo, tracking_conn, delete_after=not args.keep)
+
+
+def cmd_stats(args, tracking_conn):
+    """Show usage statistics."""
+    # Overall stats
+    cursor = tracking_conn.execute("""
+        SELECT
+            COUNT(*) as count,
+            SUM(audio_duration_sec) as total_sec,
+            SUM(audio_duration_sec) * ? as total_cost
+        FROM processed
+    """, (COST_PER_SECOND,))
+    row = cursor.fetchone()
+    total_count, total_sec, total_cost = row
+    total_sec = total_sec or 0
+    total_cost = total_cost or 0
+
+    # Unprocessed and skipped
+    memos = get_voice_memos_from_apple_db()
+    processed_ids = get_processed_ids(tracking_conn)
+    skipped_ids = get_skipped_ids(tracking_conn)
+    skipped_count = len(skipped_ids)
+    unprocessed = [m for m in memos if m['id'] not in processed_ids and m['id'] not in skipped_ids]
+    unprocessed_duration = sum(m['duration'] or 0 for m in unprocessed)
+
+    print("\n=== Voice Memo Transcription Stats ===\n")
+    print(f"Processed:   {total_count} memos ({format_duration(total_sec)})")
+    print(f"Skipped:     {skipped_count} memos (corrupt/failed)")
+    print(f"Remaining:   {len(unprocessed)} memos ({format_duration(unprocessed_duration)})")
+    print(f"Spent:       ${total_cost:.2f}")
+    if unprocessed_duration > 0:
+        print(f"To finish:   ~${unprocessed_duration * COST_PER_SECOND:.2f}")
+    print(f"From $50:    ${50 - total_cost:.2f} left")
+
+    # Recent daily usage
+    cursor = tracking_conn.execute("""
+        SELECT date, memo_count, duration_sec, cost_usd
+        FROM usage
+        ORDER BY date DESC
+        LIMIT 7
+    """)
+    rows = cursor.fetchall()
+
+    if rows:
+        print("\n--- Recent Usage ---")
+        print(f"{'Date':<12} {'Memos':<8} {'Duration':<10} {'Cost'}")
+        for date, count, dur, cost in rows:
+            print(f"{date:<12} {count:<8} {format_duration(dur):<10} ${cost:.2f}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Process Voice Memos with AssemblyAI transcription"
+    )
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+
+    # list
+    list_parser = subparsers.add_parser('list', help='Show voice memos')
+    list_parser.add_argument('--all', '-a', action='store_true', help='Include processed memos')
+
+    # transcribe
+    trans_parser = subparsers.add_parser('transcribe', help='Transcribe specific memo(s)')
+    trans_parser.add_argument('files', nargs='+', help='Filename or ID to transcribe')
+    trans_parser.add_argument('--force', '-f', action='store_true', help='Re-transcribe even if processed')
+    trans_parser.add_argument('--keep', '-k', action='store_true', help='Keep on AssemblyAI (no delete)')
+
+    # process
+    proc_parser = subparsers.add_parser('process', help='Auto-process memos')
+    proc_parser.add_argument('--minutes', '-m', type=int, default=30, help='Max minutes to process (default: 30)')
+    proc_parser.add_argument('--dry-run', '-n', action='store_true', help='Show what would be processed')
+    proc_parser.add_argument('--keep', '-k', action='store_true', help='Keep on AssemblyAI (no delete)')
+
+    # stats
+    subparsers.add_parser('stats', help='Show usage statistics')
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    # Initialize tracking database
+    tracking_conn = init_tracking_db()
+
+    # Add unique constraint if missing (for usage table date)
+    try:
+        tracking_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_date ON usage(date)")
+        tracking_conn.commit()
+    except:
+        pass
+
+    if args.command == 'list':
+        cmd_list(args, tracking_conn)
+    elif args.command == 'transcribe':
+        cmd_transcribe(args, tracking_conn)
+    elif args.command == 'process':
+        cmd_process(args, tracking_conn)
+    elif args.command == 'stats':
+        cmd_stats(args, tracking_conn)
+
+    tracking_conn.close()
+
+
+if __name__ == '__main__':
+    main()

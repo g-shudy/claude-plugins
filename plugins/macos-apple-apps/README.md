@@ -11,6 +11,7 @@ This plugin gives Claude Code read and (with confirmation) write access to:
 - **📧 Mail** - Unread messages, search, send (with confirmation)
 - **💬 Messages** - Recent iMessages via SQLite (send with confirmation)
 - **✅ Reminders** - Tasks, due dates, priorities, location-based alerts
+- **🎙️ Voice Memos** - Transcription with speaker diarization via AssemblyAI
 - **🍎 Health** - Health data queries (read-only)
 - **🏃 Fitness** - Activity and workout data (read-only)
 - **⚡ Shortcuts** - Run user-defined macOS Shortcuts
@@ -36,7 +37,7 @@ The plugin includes helper scripts for accessing Apple apps. Install them to `~/
 ```bash
 # From the plugin directory
 cp scripts/* ~/bin/
-chmod +x ~/bin/{mail-unread,imessage-recent,calendar-*,contacts-search,reminders-list}
+chmod +x ~/bin/{mail-unread,imessage-recent,calendar-*,contacts-search,reminders-list,voice-memos}
 ```
 
 Or use the provided install script:
@@ -127,6 +128,15 @@ The plugin relies on helper scripts that encapsulate AppleScript/SQLite access:
 - **`reminders-list -o`** - Overdue
 - **`reminders-list -l "List Name"`** - Filter by list
 
+### Voice Memos
+
+- **`voice-memos list`** - Show unprocessed voice memos
+- **`voice-memos list --all`** - Show all memos (including processed)
+- **`voice-memos process`** - Auto-transcribe (prioritizes recent memos)
+- **`voice-memos process --dry-run`** - Preview what would be processed
+- **`voice-memos transcribe <file>`** - Transcribe specific memo
+- **`voice-memos stats`** - Show usage/cost statistics
+
 ## Access Patterns
 
 ### AppleScript-based (most apps)
@@ -158,6 +168,29 @@ imessage-recent -p "lunch"
 # Check for notation patterns
 imessage-recent -n
 ```
+
+### SQLite + AssemblyAI (Voice Memos)
+
+Voice Memos are read from Apple's synced database and transcribed via AssemblyAI:
+
+```bash
+# List unprocessed memos
+voice-memos list
+
+# Auto-transcribe all pending
+voice-memos process
+
+# Check cost/usage
+voice-memos stats
+```
+
+**Databases**:
+- Apple source: `~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings/CloudRecordings.db`
+- Tracking: `~/.voice-memos.db` (processed, usage, skipped)
+
+**Output**: Transcripts saved to `~/Vault/Voice-Transcripts/` with speaker diarization
+
+**Requirements**: `ASSEMBLYAI_API_KEY` env var, `pip install assemblyai`
 
 ### Health/Fitness (healthexport)
 
@@ -196,6 +229,7 @@ The following operations **ALWAYS** require explicit user confirmation:
 - ❌ Creating/modifying reminders
 - ❌ Running shortcuts
 - ❌ Accessing health data
+- ❌ Transcribing voice memos (incurs AssemblyAI costs ~$0.0025/min)
 
 ### Safe Operations (Read-Only)
 
@@ -205,6 +239,8 @@ The following operations **ALWAYS** require explicit user confirmation:
 - ✅ Reading recent iMessages
 - ✅ Querying reminder status
 - ✅ Viewing health/fitness stats
+- ✅ Listing voice memos (`voice-memos list`)
+- ✅ Checking voice-memos stats (`voice-memos stats`)
 
 ### Privacy Notes
 
