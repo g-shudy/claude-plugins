@@ -34,6 +34,41 @@ photos-query -l 5 -j            # Last 5 photos as JSON
 
 **Note**: Works by querying Photos.sqlite database directly - does NOT require Photos.app to be running
 
+---
+
+**`photos-search`** - Search photos by text content (Live Text/OCR)
+
+```bash
+photos-search "VIN 1G6DD"       # Search for VIN number
+photos-search "receipt" -l 5    # Search with limit
+photos-search "PBE-193" --json  # Output as JSON
+photos-search --status          # Show index status
+photos-search --update          # Update index with new photos
+photos-search --rebuild         # Force full index rebuild
+```
+
+**How it works**:
+- Uses Apple's Live Text (OCR) data stored in Photos.sqlite
+- Maintains a local SQLite index at `~/.cache/photos-ocr-index/`
+- Index auto-updates when Photos library changes
+- First run builds full index (~20k photos takes 2-3 minutes)
+
+**Index freshness strategy**:
+- Compares Photos.sqlite modification time to index timestamp
+- Incrementally indexes only new photos since last update
+- Tracks last indexed photo PK for efficient updates
+
+**Output includes**:
+- Photo UUID and filename
+- Date created
+- File path (if available)
+- Match context (surrounding text)
+
+**Use cases**:
+- Find photos of documents, receipts, VINs, license plates
+- Search for text in screenshots
+- Locate photos with specific words visible
+
 ## Common Patterns
 
 ### Find Recent Photos
@@ -133,6 +168,32 @@ photos-query -l 10
 ```
 
 List 10 most recent photos with dates and file paths.
+
+### User: "Find photos with my VIN number"
+
+```bash
+photos-search "1G6DD67V" --json
+```
+
+Search for photos containing VIN (or partial VIN). Returns photos with the text visible.
+
+### User: "Find photos of receipts"
+
+```bash
+photos-search "receipt" -l 20
+```
+
+Search for photos containing the word "receipt" in visible text.
+
+### User: "Find photos showing license plate PBE-193"
+
+```bash
+photos-search "PBE-193"
+# Or without hyphen:
+photos-search "PBE193"
+```
+
+Search for photos showing specific license plate.
 
 ### User: "I need to see the last photo in my library"
 

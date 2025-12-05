@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""
+photos-search - Search Apple Photos by text content (Live Text/OCR)
+
+Uses Apple's built-in character recognition data stored in Photos.sqlite.
+Searches are performed against a local index for speed, with automatic
+incremental updates when the Photos library changes.
+"""
+
+import sqlite3
+import argparse
+import json
+import sys
+import os
+import ctypes
+from ctypes import c_size_t, c_uint32, c_void_p, create_string_buffer
+import plistlib
+import re
+from datetime import datetime, timedelta
+from pathlib import Path
+import hashlib
+
+# Apple's reference date: 2001-01-01 00:00:00 UTC
+APPLE_EPOCH = datetime(2001, 1, 1)
+
+# Cache location
+CACHE_DIR = Path.home() / ".cache" / "photos-ocr-index"
+INDEX_FILE = CACHE_DIR / "ocr_index.sqlite"
+META_FILE = CACHE_DIR / "index_meta.json"
+
+
+def apple_timestamp_to_datetime(timestamp):
+    """Convert Apple Core Data timestamp to datetime"""
+    if timestamp is None:
+        return None
+    return APPLE_EPOCH + timedelta(seconds=timestamp)
+
+
+def get_photos_library_path():
+    """Find the Photos library path"""
+    default_path = Path.home() / "Pictures" / "Photos Library.photoslibrary"
+    if default_path.exists():
+        return default_path
+    return None
+
+
+def decompress_lzfse(data, expected_size):
+    """Decompress LZFSE compressed data using macOS libcompression"""
+    try:
+        lib = ctypes.CDLL('/usr/lib/libcompression.dylib')
+        lib.compression_decode_buffer.argtypes = [c_void_p, c_size_t, c_void_p, c_size_t, c_void_p, c_uint32]
+        lib.compression_decode_buffer.restype = c_size_t
+
+        # Allocate buffer with some extra space
+        dst = create_string_buffer(expected_size + 10000)
+        result = lib.compression_decode_buffer(
+            dst, expected_size + 10000,
+            data, len(data),
+            None, 0x801  # COMPRESSION_LZFSE
+        )
+
+        if result > 0:
+            return dst.raw[:result]
+    except Exception:
+        pass
+    return None
+
+
+def extract_text_from_ocr_blob(ocr_blob):
+    """Extract readable text from OCR blob"""
+    try:
+        data = plistlib.loads(ocr_blob)
+        objects = data.get('$objects', [])
+
+        # Find the compressed data and expected size
+        ocr_data = None
+        expected_size = 1000000
+
+        for obj in objects:
+            if isinstance(obj, dict) and 'kCROutputRegionUncompressedDataSize' in obj:
+                expected_size = obj['kCROutputRegionUncompressedDataSize']
+
+        # Find the bytes object (compressed OCR data)
+        for obj in objects:
+            if isinstance(obj, bytes) and len(obj) > 1000:
+                ocr_data = obj
+                break
+
+        if ocr_data:
+            decoded = decompress_lzfse(ocr_data, expected_size)
+            if decoded:
+                text = decoded.decode('utf-8', errors='ignore')
+                # Extract readable words (3+ alphanumeric chars)
+                words = re.findall(r'[A-Za-z0-9]{3,}', text)
+                # Filter out internal class/region names
+                filtered = [w for w in words if not any(x in w for x in
+                    ['CRDocument', 'CRBlock', 'CRLine', 'CRWord', 'CRCharacter',
+                     'OutputRegion', 'eMYS', 'eMi@', 'qGt@', 'vA?P'])]
+                return ' '.join(filtered)
+    except Exception:
+        pass
+    return ""
+
+
+def get_db_modification_time(library_path):
+    """Get the modification time of Photos.sqlite"""
+    db_path = library_path / "database" / "Photos.sqlite"
+    if db_path.exists():
+        return db_path.stat().st_mtime
+    return 0
+
+
+def load_index_meta():
+    """Load index metadata"""
+    if META_FILE.exists():
+        try:
+            with open(META_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"last_db_mtime": 0, "photo_count": 0, "last_indexed_pk": 0}
+
+
+def save_index_meta(meta):
+    """Save index metadata"""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(META_FILE, 'w') as f:
+        json.dump(meta, f)
+
+
+def needs_index_update(library_path):
+    """Check if index needs updating"""
+    meta = load_index_meta()
+    current_mtime = get_db_modification_time(library_path)
+    return current_mtime > meta.get("last_db_mtime", 0)
+
+
+def build_or_update_index(library_path, force=False, verbose=False):
+    """Build or incrementally update the OCR text index"""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    meta = load_index_meta()
+    db_path = library_path / "database" / "Photos.sqlite"
+
+    # Create index database if needed
+    index_conn = sqlite3.connect(str(INDEX_FILE))
+    index_cursor = index_conn.cursor()
+
+    index_cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ocr_text (
+            photo_pk INTEGER PRIMARY KEY,
+            uuid TEXT,
+            filename TEXT,
+            date_created REAL,
+            directory TEXT,
+            ocr_text TEXT
+        )
+    """)
+    index_cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ocr_text ON ocr_text(ocr_text)
+    """)
+    index_conn.commit()
+
+    # Get last indexed PK for incremental updates
+    last_pk = 0 if force else meta.get("last_indexed_pk", 0)
+
+    # Connect to Photos database
+    photos_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    photos_cursor = photos_conn.cursor()
+
+    # Count new photos to process
+    photos_cursor.execute("""
+        SELECT COUNT(*) FROM ZASSET a
+        JOIN ZMEDIAANALYSISASSETATTRIBUTES m ON a.Z_PK = m.ZASSET
+        JOIN ZCHARACTERRECOGNITIONATTRIBUTES c ON m.Z_PK = c.ZMEDIAANALYSISASSETATTRIBUTES
+        WHERE c.ZCHARACTERRECOGNITIONDATA IS NOT NULL
+        AND a.ZTRASHEDSTATE = 0
+        AND a.Z_PK > ?
+    """, (last_pk,))
+    new_count = photos_cursor.fetchone()[0]
+
+    if new_count == 0 and not force:
+        if verbose:
+            print("Index is up to date")
+        photos_conn.close()
+        index_conn.close()
+        return
+
+    if verbose:
+        print(f"Indexing {new_count} photos...")
+
+    # Fetch and process new photos
+    photos_cursor.execute("""
+        SELECT
+            a.Z_PK,
+            a.ZUUID,
+            a.ZFILENAME,
+            a.ZDATECREATED,
+            a.ZDIRECTORY,
+            c.ZCHARACTERRECOGNITIONDATA
+        FROM ZASSET a
+        JOIN ZMEDIAANALYSISASSETATTRIBUTES m ON a.Z_PK = m.ZASSET
+        JOIN ZCHARACTERRECOGNITIONATTRIBUTES c ON m.Z_PK = c.ZMEDIAANALYSISASSETATTRIBUTES
+        WHERE c.ZCHARACTERRECOGNITIONDATA IS NOT NULL
+        AND a.ZTRASHEDSTATE = 0
+        AND a.Z_PK > ?
+        ORDER BY a.Z_PK
+    """, (last_pk,))
+
+    processed = 0
+    max_pk = last_pk
+
+    for row in photos_cursor.fetchall():
+        pk, uuid, filename, date_created, directory, ocr_blob = row
+
+        # Extract text
+        text = extract_text_from_ocr_blob(ocr_blob)
+
+        if text:
+            index_cursor.execute("""
+                INSERT OR REPLACE INTO ocr_text
+                (photo_pk, uuid, filename, date_created, directory, ocr_text)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (pk, uuid, filename, date_created, directory, text))
+
+        max_pk = max(max_pk, pk)
+        processed += 1
+
+        if verbose and processed % 500 == 0:
+            print(f"  Processed {processed}/{new_count}...")
+            index_conn.commit()
+
+    index_conn.commit()
+
+    # Update metadata
+    meta["last_db_mtime"] = get_db_modification_time(library_path)
+    meta["last_indexed_pk"] = max_pk
+
+    # Get total count
+    index_cursor.execute("SELECT COUNT(*) FROM ocr_text")
+    meta["photo_count"] = index_cursor.fetchone()[0]
+
+    save_index_meta(meta)
+
+    if verbose:
+        print(f"Done. Index contains {meta['photo_count']} photos with OCR text.")
+
+    photos_conn.close()
+    index_conn.close()
+
+
+def search_photos(query, limit=20, case_sensitive=False):
+    """Search photos by text content"""
+    if not INDEX_FILE.exists():
+        return []
+
+    conn = sqlite3.connect(str(INDEX_FILE))
+    cursor = conn.cursor()
+
+    # Build search pattern
+    if case_sensitive:
+        pattern = f"%{query}%"
+        cursor.execute("""
+            SELECT uuid, filename, date_created, directory, ocr_text
+            FROM ocr_text
+            WHERE ocr_text LIKE ?
+            ORDER BY date_created DESC
+            LIMIT ?
+        """, (pattern, limit))
+    else:
+        pattern = f"%{query.upper()}%"
+        cursor.execute("""
+            SELECT uuid, filename, date_created, directory, ocr_text
+            FROM ocr_text
+            WHERE UPPER(ocr_text) LIKE ?
+            ORDER BY date_created DESC
+            LIMIT ?
+        """, (pattern, limit))
+
+    results = []
+    library_path = get_photos_library_path()
+
+    for row in cursor.fetchall():
+        uuid, filename, date_created, directory, ocr_text = row
+
+        result = {
+            "uuid": uuid,
+            "filename": filename,
+            "dateCreated": apple_timestamp_to_datetime(date_created).isoformat() if date_created else None,
+        }
+
+        # Build file path
+        if library_path and directory and filename:
+            for subdir in ["originals", "Masters"]:
+                path = library_path / subdir / directory / filename
+                if path.exists():
+                    result["filePath"] = str(path)
+                    break
+
+        # Extract matching context
+        text_upper = ocr_text.upper()
+        query_upper = query.upper()
+        pos = text_upper.find(query_upper)
+        if pos >= 0:
+            start = max(0, pos - 30)
+            end = min(len(ocr_text), pos + len(query) + 30)
+            result["matchContext"] = "..." + ocr_text[start:end] + "..."
+
+        results.append(result)
+
+    conn.close()
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Search Apple Photos by text content (Live Text/OCR)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  photos-search "VIN 1G6DD"           # Search for VIN number
+  photos-search "PBE-193" -l 5        # Search plate, limit to 5 results
+  photos-search "receipt" --json      # Output as JSON
+  photos-search --rebuild             # Force rebuild index
+  photos-search --status              # Show index status
+
+Exit codes:
+  0    Success
+  1    Invalid arguments
+  2    Error accessing Photos library
+        """
+    )
+
+    parser.add_argument(
+        'query',
+        nargs='?',
+        help='Text to search for in photos'
+    )
+
+    parser.add_argument(
+        '-l', '--limit',
+        type=int,
+        default=20,
+        help='Maximum results to return (default: 20)'
+    )
+
+    parser.add_argument(
+        '-j', '--json',
+        action='store_true',
+        help='Output as JSON'
+    )
+
+    parser.add_argument(
+        '-c', '--case-sensitive',
+        action='store_true',
+        help='Case-sensitive search'
+    )
+
+    parser.add_argument(
+        '--rebuild',
+        action='store_true',
+        help='Force rebuild of OCR text index'
+    )
+
+    parser.add_argument(
+        '--update',
+        action='store_true',
+        help='Update index with new photos only'
+    )
+
+    parser.add_argument(
+        '--status',
+        action='store_true',
+        help='Show index status'
+    )
+
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Verbose output during indexing'
+    )
+
+    args = parser.parse_args()
+
+    # Find Photos library
+    library_path = get_photos_library_path()
+    if not library_path:
+        print("Error: Could not find Photos library", file=sys.stderr)
+        sys.exit(2)
+
+    # Handle status check
+    if args.status:
+        meta = load_index_meta()
+        needs_update = needs_index_update(library_path)
+        print(f"Index location: {INDEX_FILE}")
+        print(f"Photos indexed: {meta.get('photo_count', 0)}")
+        print(f"Last indexed PK: {meta.get('last_indexed_pk', 0)}")
+        print(f"Needs update: {'Yes' if needs_update else 'No'}")
+        sys.exit(0)
+
+    # Handle rebuild
+    if args.rebuild:
+        print("Rebuilding OCR text index...")
+        build_or_update_index(library_path, force=True, verbose=True)
+        sys.exit(0)
+
+    # Handle update
+    if args.update:
+        print("Updating OCR text index...")
+        build_or_update_index(library_path, force=False, verbose=True)
+        sys.exit(0)
+
+    # Require query for search
+    if not args.query:
+        parser.print_help()
+        sys.exit(1)
+
+    # Auto-update index if needed
+    if needs_index_update(library_path):
+        if args.verbose:
+            print("Index out of date, updating...", file=sys.stderr)
+        build_or_update_index(library_path, force=False, verbose=args.verbose)
+
+    # Check if index exists
+    if not INDEX_FILE.exists():
+        print("Index not found. Building index (this may take a few minutes)...", file=sys.stderr)
+        build_or_update_index(library_path, force=True, verbose=True)
+
+    # Perform search
+    try:
+        results = search_photos(args.query, args.limit, args.case_sensitive)
+
+        if args.json:
+            output = {
+                "query": args.query,
+                "count": len(results),
+                "photos": results
+            }
+            print(json.dumps(output, indent=2))
+        else:
+            if not results:
+                print(f"No photos found matching '{args.query}'")
+                sys.exit(0)
+
+            print(f"Found {len(results)} photo(s) matching '{args.query}':\n")
+            for i, photo in enumerate(results, 1):
+                print(f"{i}. {photo['filename']}")
+                print(f"   Date: {photo['dateCreated']}")
+                if photo.get('filePath'):
+                    print(f"   Path: {photo['filePath']}")
+                if photo.get('matchContext'):
+                    print(f"   Match: {photo['matchContext']}")
+                print()
+
+    except Exception as e:
+        print(f"Error searching photos: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
